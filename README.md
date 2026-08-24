@@ -1,3 +1,9 @@
+Hi, this is an unoriginal C++ orderbook project! I know, unheard of, so innovative. However, I'm building this orderbook by hand, using minimal AI, just to really understand the underlying theory and logic behind orderbooks by Q&A's! 
+
+I will attach my hand-written notes to this repo in the future, perhaps as some sort of proof of concept? I'll also be happy to discuss any of my projects by call with anyone. I believe in AI, but not on scamming a github profile with vibecoded projects, thank you very much. 
+
+Moving on from this introduction, let's go back to formality shall we?
+
 # C++ Order Book from Scratch
 
 A correctness-first C++20 limit order book and matching-engine learning project.
@@ -19,3 +25,4 @@ order-location data structures. Matching behavior is under active development.
 
 V2 will revisit the design with execution-report events, replay, profiling,
 cache-friendly containers, and production-oriented memory management.
+

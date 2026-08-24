@@ -9,9 +9,8 @@ std::vector<Trade> OrderBook::submit_limit_order(OrderId order_id, Side side,
     if(price == 0) throw std::invalid_argument("Price cannot be zero.");
     if(quantity == 0) throw std::invalid_argument("Quantity cannot be zero.");
 
-
     // set incoming_remaining = quantity
-
+    
     // Examine best price on opposite side
 
     // while best price crosses the limit:
