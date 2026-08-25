@@ -15,6 +15,7 @@ public:
         Quantity quantity,
         TimeInForce time_in_force
     );
+    [[nodiscard]] bool cancel_order(OrderId order_id);
     std::optional<Price> best_bid() const;
     std::optional<Price> best_ask() const;
 

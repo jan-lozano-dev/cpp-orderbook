@@ -8,6 +8,7 @@ class PriceLevel{
 public:
     using Iterator = std::list<Order>::iterator;
     Iterator add_order(const Order &order);
+    void erase_order(Iterator order);
     const Order& front_order() const;
     bool empty() const;
     Quantity total_quantity() const;

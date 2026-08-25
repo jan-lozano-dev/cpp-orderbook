@@ -10,6 +10,14 @@ PriceLevel::Iterator PriceLevel::add_order(const Order &order)
     return std::prev(orders_.end());
 }
 
+void PriceLevel::erase_order(Iterator order)
+{
+    if(order == orders_.end()) throw std::invalid_argument("Cannot erase the end iterator.");
+
+    total_quantity_ -= order->quantity;
+    orders_.erase(order);
+}
+
 const Order& PriceLevel::front_order() const
 {
     if(orders_.empty()) 

@@ -71,6 +71,20 @@ void test_orders_have_fifo_priority()
             "aggregate quantity should exclude the filled order");
 }
 
+void test_erase_order_updates_state()
+{
+    PriceLevel level;
+    const auto first = level.add_order(Order{1, 10});
+    level.add_order(Order{2, 5});
+
+    level.erase_order(first);
+
+    require(level.front_order().order_id == 2,
+            "erasing an order should remove the selected order");
+    require(level.total_quantity() == 5,
+            "erasing an order should update aggregate quantity");
+}
+
 void test_partial_fill_preserves_priority()
 {
     PriceLevel level;
@@ -134,6 +148,7 @@ int main()
         test_new_level_is_empty();
         test_add_order_updates_state();
         test_orders_have_fifo_priority();
+        test_erase_order_updates_state();
         test_partial_fill_preserves_priority();
         test_complete_fill_can_empty_level();
         test_invalid_operations_do_not_mutate_level();
