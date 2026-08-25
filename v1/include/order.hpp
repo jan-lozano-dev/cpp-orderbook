@@ -1,8 +1,9 @@
 #pragma once
+
 #include <cstdint>
 
-using OrderId = std::uint64_t; // OrderId is a type alias for uint64_t, representing the unique identifier for an order.
-using Quantity = std::uint64_t; // Quantity is a type alias for uint64_t, representing the quantity of an order.
+using OrderId = std::uint64_t;
+using Quantity = std::uint64_t;
 using Price = std::uint64_t;
 
 enum class Side {
@@ -11,13 +12,12 @@ enum class Side {
 };
 
 enum class TimeInForce {
-    gtc, // Good 'Til Canceled
-    ioc, // Immediate or Cancel
-    fok  // Fill or Kill
+    gtc, // Good 'Til Cancelled: rest any unfilled quantity.
+    ioc, // Immediate or Cancel: discard any unfilled quantity.
+    fok  // Fill or Kill: execute fully or do nothing.
 };
 
 struct Order {
     OrderId order_id;
     Quantity quantity;
 };
-

@@ -85,6 +85,22 @@ void test_erase_order_updates_state()
             "erasing an order should update aggregate quantity");
 }
 
+void test_reduce_order_quantity_updates_state()
+{
+    PriceLevel level;
+    const auto order = level.add_order(Order{1, 10});
+    level.add_order(Order{2, 5});
+
+    level.reduce_order_quantity(order, 4);
+
+    require(level.front_order().order_id == 1,
+            "reducing quantity should preserve order priority");
+    require(level.front_order().quantity == 4,
+            "reducing quantity should update the order");
+    require(level.total_quantity() == 9,
+            "reducing quantity should update aggregate quantity");
+}
+
 void test_partial_fill_preserves_priority()
 {
     PriceLevel level;
@@ -126,13 +142,19 @@ void test_invalid_operations_do_not_mutate_level()
         [&level] { level.apply_fill_front(1); },
         "filling an empty level should be rejected");
 
-    level.add_order(Order{2, 5});
+    const auto order = level.add_order(Order{2, 5});
     require_throws<std::invalid_argument>(
         [&level] { level.apply_fill_front(0); },
         "a zero-quantity fill should be rejected");
     require_throws<std::invalid_argument>(
         [&level] { level.apply_fill_front(6); },
         "an overfill should be rejected");
+    require_throws<std::invalid_argument>(
+        [&level, order] { level.reduce_order_quantity(order, 0); },
+        "a zero-quantity amendment should be rejected");
+    require_throws<std::invalid_argument>(
+        [&level, order] { level.reduce_order_quantity(order, 6); },
+        "a quantity increase should not use the reduction path");
 
     require(level.front_order().quantity == 5,
             "rejected fills should not change the front order");
@@ -149,6 +171,7 @@ int main()
         test_add_order_updates_state();
         test_orders_have_fifo_priority();
         test_erase_order_updates_state();
+        test_reduce_order_quantity_updates_state();
         test_partial_fill_preserves_priority();
         test_complete_fill_can_empty_level();
         test_invalid_operations_do_not_mutate_level();

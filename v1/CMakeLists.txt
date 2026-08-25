@@ -11,15 +11,7 @@ add_library(orderbook_v1
     src/price_level.cpp
 )
 
-target_include_directories(orderbook_v1 PUBLIC
-    include
-)
-
-if(MSVC)
-    target_compile_options(orderbook_v1 PRIVATE /W4)
-else()
-    target_compile_options(orderbook_v1 PRIVATE -Wall -Wextra -Wpedantic)
-endif()
+target_include_directories(orderbook_v1 PUBLIC include)
 
 enable_testing()
 
@@ -34,3 +26,11 @@ add_executable(orderbook_tests
 )
 target_link_libraries(orderbook_tests PRIVATE orderbook_v1)
 add_test(NAME orderbook_tests COMMAND orderbook_tests)
+
+foreach(target orderbook_v1 price_level_tests orderbook_tests)
+    if(MSVC)
+        target_compile_options(${target} PRIVATE /W4 /permissive-)
+    else()
+        target_compile_options(${target} PRIVATE -Wall -Wextra -Wpedantic)
+    endif()
+endforeach()
