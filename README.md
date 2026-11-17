@@ -24,6 +24,83 @@ project, not a claim that a few `std::map`s are ready to run an exchange.
 
 V1 is feature-complete for this scope.
 
+## Design
+
+```mermaid
+flowchart LR
+    OB["OrderBook"]
+
+    subgraph BIDS["bids: highest price first"]
+        direction TB
+        B1["10000"] --> B2["9990"] --> B3["9980"]
+    end
+
+    subgraph ASKS["asks: lowest price first"]
+        direction TB
+        A1["10010"] --> A2["10020"] --> A3["10030"]
+    end
+
+    subgraph LEVEL["PriceLevel at 10010"]
+        direction LR
+        O1["id 7, qty 5"] --> O2["id 12, qty 3"] --> O3["id 15, qty 8"]
+    end
+
+    LOC["order_locations: id to side, price, list iterator"]
+
+    OB --> BIDS
+    OB --> ASKS
+    OB --> LOC
+    A1 -.-> LEVEL
+    LOC -.-> O2
+```
+
+The price maps make the best bid and ask available at `begin()`. A linked list
+inside each level provides stable iterators and constant-time removal once an
+order is found. Each level also keeps its total quantity, so FOK checks don't
+have to walk the list. The location hash map avoids scanning the book during
+cancel or amend operations.
+
+## Submitting an order
+
+```mermaid
+flowchart TD
+    IN(["new order"]) --> VAL{"valid and ID unused?"}
+    VAL -- no --> ERR["throw"]
+    VAL -- yes --> FOK{"FOK?"}
+    FOK -- yes --> CHK{"enough crossing liquidity?"}
+    CHK -- no --> NONE["return, book unchanged"]
+    CHK -- yes --> MATCH
+    FOK -- no --> MATCH["match against opposite side"]
+    MATCH --> REM{"quantity left?"}
+    REM -- no --> DONE(["return trades"])
+    REM -- yes --> KIND{"type"}
+    KIND -- GTC --> REST["rest at back of its price level"]
+    KIND -- "IOC / market" --> DROP["discard remainder"]
+    REST --> DONE
+    DROP --> DONE
+```
+
+Matching always takes the best opposite level first and fills the order at the
+front of that level. It keeps going until the incoming order is filled, the
+book side is empty, or the next level no longer crosses the limit price. Empty
+levels are erased as soon as their last order is filled.
+
+For example, with asks of 3 and 2 at 10010 and 6 at 10020, a GTC buy for 10 at
+10020 trades 3 and 2 at 10010, then 5 at 10020. The order at 10020 keeps its
+place with 1 left, and nothing rests on the bid side.
+
+## Amending an order
+
+```mermaid
+flowchart TD
+    A(["amend"]) --> SAME{"same price and quantity not increased?"}
+    SAME -- yes --> SHRINK["reduce in place, keep priority"]
+    SAME -- no --> CR["cancel and resubmit as GTC, lose priority"]
+```
+
+`new_quantity` in `amend_order` means the order's new remaining quantity, not
+its original submitted quantity.
+
 ## Matching rules
 
 The implementation makes a few policies explicit:
@@ -39,24 +116,6 @@ The implementation makes a few policies explicit:
   order loses priority. A new price may cross and generate trades immediately.
 - Order IDs must be unique while active. An ID can be reused after its order is
   filled or cancelled.
-
-`new_quantity` in `amend_order` means the order's new remaining quantity, not
-its original submitted quantity.
-
-## Design
-
-```text
-OrderBook
-├── bids: map ordered highest price first
-├── asks: map ordered lowest price first
-├── PriceLevel: FIFO list of orders at one price
-└── order locations: hash map from ID to side, price, and list iterator
-```
-
-The price maps make the best bid and ask available at `begin()`. A linked list
-inside each level provides stable iterators and constant-time removal once an
-order is found. The location hash map avoids scanning the book during cancel or
-amend operations.
 
 The implementation favors clarity over production optimizations. V2 can
 experiment with flatter containers, memory pools, event replay, execution
