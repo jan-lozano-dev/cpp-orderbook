@@ -1,206 +1,359 @@
-# Ideas for V2
+# V2: fast, then distributed
 
-V1 is a correct, single-threaded matching engine. V2 has two goals:
+V1 is a correct, single-threaded, single-instrument matching engine. It is
+**frozen**. It is the spec: V2 is correct exactly when it does what V1 does.
 
-1. **Make it fast** and prove it with measurements.
-2. **Make it distributed**, with networking, replication and failover.
+V2 has two goals, in this order:
 
-V1 stays untouched. It is the base that everything below is built on, and it
-is the reference for checking that V2 behaves the same.
+1. **Fast.** Make the matching core much faster, and prove it with numbers.
+2. **Distributed.** Wrap the core in a network, a log, replication and
+   failover, without changing a single matching rule.
+
+The guiding rules:
+
+- **No optimization without a measurement.** Every change comes with a before
+  and after number.
+- **No feature without a test that would catch it breaking.**
+- **The simplest thing that works, then iterate.** One machine, one instrument,
+  one process per role. Every step ends in something you can run.
+
+---
+
+## 0. Before anything: make V1 a usable reference
+
+Everything below depends on one property: **determinism**. The same input
+sequence must always produce byte-identical output. Check this first:
+
+- [ ] No wall-clock time inside matching. Timestamps come *in* with the order
+      (later, the sequencer stamps them).
+- [ ] No output order that depends on `unordered_map` iteration, pointer values
+      or hashing.
+- [ ] Define one canonical output: a text or binary **event stream** (accepts,
+      fills, cancels, rejects), one event per line. Every later test compares
+      these streams.
+- [ ] Test: run the same 1M-order file twice and `diff` the outputs. They must
+      be identical.
+
+If this fails, fix it in V1 now. This is the only V1 change allowed.
 
 ---
 
 ## Part A: Performance
 
-### 1. Benchmark harness first
+### A1. Benchmark harness (build this before touching any code)
 
-We need to know V1's baseline performance before changing anything. It would
-also be nice to learn how to run professional benchmarks for programs like
-this one.
+The benchmark is a product in its own right. If it is wrong, every decision
+built on it is wrong.
 
-- Replay a fixed, synthetic order flow (for example 80% limit, 10% cancel,
-  10% market).
-- Report orders per second and latency at p50, p99 and p99.9.
+**Workload.** A generator with a fixed seed writes order files to disk. The
+benchmark replays the file, so every run sees the same input.
 
-### 1.5. Profile V1's slowest parts (perf tool)
+| Knob | Default |
+|---|---|
+| Mix | 80% limit, 10% cancel, 10% market |
+| Price distribution | Clustered near the mid (most real flow is within a few ticks) |
+| Book depth at start | Pre-filled with N resting orders |
+| Size | 10M orders |
 
-Profiling means measuring where the program spends its time, so we optimize
-the slow parts instead of guessing.
+Make the mix a parameter. Also keep a few adversarial files: many deep levels,
+cancel-heavy flow, and one giant market order that sweeps the book.
+
+**Measurement.**
+
+- Measure matching only (orders already in memory, no I/O, no parsing). This is
+  the *core* number. End-to-end numbers come later, in Part B.
+- Time each order with a cheap clock (`rdtsc`, or `steady_clock` if that is
+  fast enough; measure the clock's own overhead first).
+- Record latencies into a histogram (HdrHistogram or a simple log-bucket
+  array). Do not sort a 10M vector or print on the hot path.
+- Report throughput (orders/s) and p50 / p99 / p99.9 / max.
+- Warm up first, discard the warmup, then run 5+ times. Report median and
+  spread. A single run proves nothing.
+
+**Environment** (write it into every result):
+
+- CPU model, compiler and flags (`-O2 -march=native`), commit hash.
+- Pin to one core (`taskset -c 2`). Plug the laptop in. Turbo/frequency
+  scaling moves results by 10-30%.
+- WSL2 adds noise and may limit `perf` hardware counters. Check early what
+  works; if numbers are unstable, run on bare Linux for final results.
+
+**Deliverable:** `./bench --file flow.bin` prints one table. Results go in
+`bench/results.md`, one row per commit.
+
+### A2. Profile V1
+
+Find where the time actually goes. Do not guess.
 
 ```sh
-perf record -g ./benchmark   # run the program and sample it
-perf report                  # table of where the time went
+cmake -DCMAKE_BUILD_TYPE=RelWithDebInfo ..   # -O2 -g
+perf stat -e cycles,instructions,cache-misses,branch-misses ./bench
+perf record -g ./bench && perf report
+# flamegraph: perf script | stackcollapse-perf.pl | flamegraph.pl > v1.svg
 ```
 
-A flamegraph shows the same data as boxes: the wider the box, the more time
-is spent in that function. Build with `-O2 -g` so results are realistic.
+- `perf stat` says *what kind* of slow it is (cache misses? branches? just too
+  many instructions?).
+- `perf record` / flamegraph says *where*. A wider box means more time.
+- Write down the top 3 costs. That list is the plan for A3.
 
-### 2. Change the data structures to tackle HFT level
+Expected suspects for a `std::map` + `std::list` + `unordered_map` design:
+`malloc`/`free` per order, pointer chasing through tree and list nodes, and
+hashing on cancel. Confirm or disprove each one.
 
-Ideas, to be decided after profiling:
+### A3. Optimize, one change at a time
 
-- Replace `std::map` with a flat, array-indexed price ladder (prices are
-  integers).
-- Replace `std::list` and `unordered_map` with an intrusive list and an order
-  pool, so there is no heap allocation per order.
+Each change is one commit, with three things: the profile that motivated it,
+the benchmark before and after, and the differential test (A4) still passing.
 
-### 3. Version testing: V2 vs V1
+Candidate changes, roughly in order of expected payoff:
 
-- Feed random order streams to both versions and check they produce the same
-  trades (differential testing).
-- Compare benchmark numbers and put them in the README.
+1. **Order pool.** Preallocate all orders in one array; free list of indices.
+   No heap allocation on the hot path. (Check: `perf` shows zero `malloc`.)
+2. **Intrusive FIFO per price level.** Orders hold `prev`/`next` *indices*
+   (32-bit, not pointers). Cancel is O(1) with no hash lookup if the order ID
+   maps directly to a pool slot.
+3. **Flat price ladder.** Prices are integer ticks, so a level is
+   `levels[price - base]`. Track best bid/ask; when a level empties, scan to
+   the next non-empty one (or keep a bitmap and use `ctz`). Pick a bounded
+   price range and reject outside it.
+4. **Data layout.** Hot fields (price, qty, next) together, cold fields
+   (client ID, timestamps) apart. Check with `cache-misses`.
+5. **Hot path hygiene.** No virtual calls, no `std::function`, no exceptions,
+   no logging. Events go into a preallocated buffer.
+
+Stop when the profile is flat or the target is met. Not before, and not after.
+
+**Target** (write a rough guess here before starting, compare at the end):
+V1 = ___ M orders/s, p99 = ___ ns. V2 goal: 5-10x throughput, p99.9 under 1 µs
+for the core.
+
+### A4. Correctness: V2 must equal V1
+
+- **Differential test.** Random seeded order streams go into V1 and V2. The
+  event streams must be identical. Run millions of orders in CI. On a mismatch,
+  shrink the input to the smallest failing case and save it as a regression
+  test.
+- **Invariants**, checked after every order in debug builds:
+  - the book is never crossed (best bid < best ask);
+  - quantity is conserved (submitted = resting + filled + cancelled);
+  - every resting order is in exactly one level, in time priority.
+- **Golden files.** A few hand-written scenarios with expected outputs, which
+  read as documentation for the matching rules.
+
+**Deliverable:** a README table, V1 vs V2, same machine, same file. Include
+the flamegraphs before and after.
 
 ---
 
-## Part B: Networking and a distributed system
+## Part B: Network and distribution
 
-V1 is the base. We do not rewrite it. We wrap it in network and replication
-layers, so the matching rules stay exactly as they are.
+The matching engine is a pure function: `(book, order) -> (book, events)`.
+Everything in Part B is plumbing around that function. If a matching rule
+changes here, something went wrong.
 
-### The big picture
+### The idea in one sentence
+
+**The log is the system.** A sequencer gives every input a number and writes
+it to a log. Any engine that replays the log from the start reaches exactly the
+same state. Replication, recovery and failover are all just "replay the log".
 
 ```mermaid
 flowchart LR
-    C1["Client 1"] --> GW
-    C2["Client 2"] --> GW
-    GW["Gateway<br/>(TCP, validates orders)"] --> SEQ
-    SEQ["Sequencer<br/>(gives every order a number)"] --> P
-    SEQ --> B
-    subgraph ENGINES["Matching engines (V1 inside)"]
-        P["Primary engine"]
-        B["Backup engine"]
-    end
-    P --> FA["Market data feed A<br/>(UDP multicast)"]
-    P --> FB["Market data feed B<br/>(UDP multicast)"]
-    FA --> SUB["Subscriber<br/>(rebuilds the book)"]
+    C["Clients"] -->|TCP| GW["Gateway<br/>parse, validate"]
+    GW --> SEQ["Sequencer<br/>number + append to log"]
+    SEQ --> LOG[("Event log<br/>append-only file")]
+    SEQ --> P["Primary engine (V2 core)"]
+    SEQ --> B["Backup engine (V2 core)"]
+    P -->|acks, fills| GW
+    P --> FA["Feed A (UDP multicast)"]
+    P --> FB["Feed B (UDP multicast)"]
+    FA --> SUB["Subscriber<br/>rebuilds the book"]
     FB --> SUB
 ```
 
-| Part | Job |
-|---|---|
-| Gateway | Accepts TCP connections, checks messages, forwards orders |
-| Sequencer | Puts all orders in one single line and numbers them 1, 2, 3... |
-| Primary engine | Runs V1 and executes the orders in that order |
-| Backup engine | Runs V1 too, receives the same numbered orders, ready to take over |
-| Feeds A and B | Two identical streams of updates for listeners |
-| Subscriber | Listens to the feed and keeps its own copy of the book |
+| Part | Job | Owns |
+|---|---|---|
+| Gateway | TCP sessions, framing, validation | Client sessions |
+| Sequencer | Total order: assigns seq 1, 2, 3... and the timestamp | The log |
+| Primary | Runs the core, sends acks and market data | Nothing (state = replay of log) |
+| Backup | Runs the core on the same input, **stays silent** | Nothing |
+| Feeds A/B | Same sequenced market data, sent twice | - |
+| Subscriber | Applies the feed, detects gaps, recovers | Its own copy of the book |
 
-### Why the sequencer matters (consistency)
+Note: the sequencer is a single point of failure in this design. That is
+fine for V2; write it down as a known limitation (see V3).
 
-The matching engine is **deterministic**: the same orders in the same order
-always give the same trades. So if two engines receive the same numbered
-orders, they end up with exactly the same book. This is called a *replicated
-state machine*.
+### B1. Binary protocol and framing
+
+- Fixed-size, little-endian, packed structs. One header: `{len, type, seq}`.
+- Messages: `NewOrder`, `Cancel`, `Ack`, `Fill`, `Reject`, `BookUpdate`,
+  `Heartbeat`, `SnapshotRequest`, `Snapshot`.
+- Every client order carries a **client order ID**. The gateway uses it to
+  drop duplicates. This makes resending safe after a failover.
+- Test: encode/decode round-trip fuzzing; split and merged TCP reads
+  (a message arriving in 1-byte pieces must still parse).
+
+### B2. TCP gateway (epoll)
+
+- One thread, non-blocking sockets, edge-triggered `epoll`. Per-connection
+  read buffer that handles partial messages.
+- Validation: price in range, qty > 0, known type. Rejects never reach the
+  sequencer.
+- Test: 100 clients sending at once; one client sending garbage must not hurt
+  the others.
+- Measure: round-trip latency client -> ack on loopback. This is the first
+  end-to-end number; compare with the core number from A1.
+
+### B3. Sequencer and event log
+
+- Assigns seq and timestamp, appends to the log (`write` to a file; measure
+  the cost with and without `fsync`, and document the choice).
+- **Recovery test:** kill the engine, start a new one, replay the log, compare
+  the book with a snapshot taken before the kill. Must be identical. This test
+  is the whole point of the design.
+- Snapshots every N messages so replay does not start from zero.
+
+### B4. Backup engine
+
+- The backup consumes the same sequenced stream and runs the same core.
+- Both engines output a hash of their state every N messages. If the hashes
+  differ, crash loudly. Then determinism is checked continuously, not only in
+  tests.
+
+### B5. Heartbeat, failover and split brain
 
 ```mermaid
 sequenceDiagram
-    participant C as Client
-    participant G as Gateway
-    participant S as Sequencer
-    participant P as Primary
-    participant B as Backup
-    C->>G: new order
-    G->>S: order
-    S->>S: assign sequence number #42
-    S->>P: #42 order
-    S->>B: #42 order
-    P->>P: match (V1)
-    B->>B: match (V1)
-    P-->>C: ack and fills
-    Note over P,B: Same input, same order, so same book
-```
-
-### Failover (leader election)
-
-The primary sends a heartbeat. If the backup stops hearing it, the backup
-becomes the new primary.
-
-```mermaid
-sequenceDiagram
-    participant P as Primary
+    participant P as Primary (term 1)
     participant B as Backup
     participant S as Sequencer
-    loop every 1 s
-        P->>B: heartbeat
+    loop every 100 ms
+        P->>S: heartbeat (term 1)
     end
-    Note over P: crash
-    B->>B: no heartbeat for 3 s, primary is dead
-    B->>S: I am the new primary, last seen #42
-    S->>B: resend from #43
-    B->>B: replay and continue
+    Note over P: crash or freeze
+    S->>S: no heartbeat for 500 ms
+    S->>B: you are primary, term 2
+    B->>B: finish applying up to last seq
+    B->>S: ready at seq 42 (term 2)
+    Note over P: wakes up, sends with term 1
+    S--xP: rejected, stale term
 ```
 
-Hard question to cover: what if the primary is only slow, not dead, and two
-engines both think they are primary? (split brain). A simple answer is a
-*term number* that grows at every election, so old primaries are ignored.
+- **The sequencer decides who is primary**, not the engines themselves. Having
+  one authority avoids two engines voting each other in.
+- **Term numbers (fencing).** Each promotion increments the term. Every output
+  carries its term. The gateway and feeds drop anything from an older term.
+  A primary that was only slow cannot do harm when it comes back.
+- **Clients:** after failover, clients resend unacked orders; the client order
+  ID makes duplicates harmless.
+- Test, the most important one in Part B: a script that kills the primary at a
+  random moment during a 1M-order run. Afterwards, the event stream (minus
+  dropped duplicates) must equal a run without the crash. Run it 100 times.
+- Measure: time from crash to first ack from the new primary.
 
-### Feeds A and B (fault tolerance)
+Heartbeat timers (100 ms / 500 ms) are starting points. Measure false
+failovers under load and tune.
 
-UDP can lose packets. We send the same updates twice, and the listener keeps
-whichever copy arrives first.
+### B6. Market data: feeds A/B and gap recovery
 
 ```mermaid
 flowchart TD
-    E["Engine sends update #57"] --> A["Feed A"]
-    E --> B["Feed B"]
-    A -->|"lost"| X(("X"))
-    B --> L["Listener gets #57 from B"]
-    L --> GAP{"Missing a number?"}
-    GAP -->|no| OK["apply update"]
-    GAP -->|yes| SNAP["ask for a snapshot over TCP"]
+    E["Update #57"] --> A["Feed A"] & B["Feed B"]
+    A -->|lost| X(("✗"))
+    B --> L["Subscriber: first copy of #57 wins"]
+    L --> G{"next seq == expected?"}
+    G -->|yes| OK["apply"]
+    G -->|duplicate| DROP["drop"]
+    G -->|gap| SNAP["buffer, fetch snapshot over TCP,<br/>apply buffered updates after it"]
 ```
 
-This uses the same idea as RIP from the networking lab: periodic
-announcements, timers to detect silence, and a clear "dead" marker.
+- Each update carries a seq. The subscriber keeps `expected_seq`.
+- Arbitration: take whichever feed delivers a seq first, drop the copy.
+- Gap on both feeds: request a snapshot (book + its seq) over TCP, keep
+  buffering live updates, then apply the ones newer than the snapshot.
+- Test: inject random loss (`tc qdisc ... netem loss 5%` on one feed, then on
+  both). The subscriber's book must always end up equal to the engine's book.
+  Compare hashes.
 
-| RIP (lab) | Order book |
-|---|---|
-| Update every 30 s | Heartbeat every 1 s |
-| 180 s timeout, route invalid | No heartbeat for 3 s, feed is stale |
-| 120 s garbage timer, metric 16 | Stale data stays flagged, then is dropped |
+Same pattern as RIP from the networking lab: periodic messages, a timeout that
+marks the source stale, and an explicit invalid state instead of silently
+using old data. If a feed has been silent for too long, the subscriber flags
+its book as stale.
 
-### The practice network (from the networking lab)
+### B7. Practice network
 
-A fake network on one PC using Linux network namespaces and virtual cables
-(veth), like the PLT1 and PLT2 routers in the lab.
+Run everything on one machine with Linux network namespaces and veth pairs,
+like PLT1/PLT2 in the lab:
 
 ```mermaid
 flowchart LR
     subgraph NET1["172.16.0.0/25 (clients)"]
-        CL["client"]
+        CL["client .2"]
     end
     subgraph NET2["172.16.0.128/26 (engines)"]
-        PR["primary<br/>.130"]
-        BK["backup<br/>.131"]
+        PR["primary .130"]
+        BK["backup .131"]
     end
-    CL --- R(("router<br/>.1 and .129"))
-    R --- PR
-    R --- BK
+    CL --- R(("router<br/>.1 / .129")) --- PR & BK
 ```
 
-Things to try: cut a virtual cable and watch the failover, compare latency
-through one router and two, capture the traffic in Wireshark, and write a small
-Lua dissector so Wireshark shows our messages as readable text.
+- One script (`net/up.sh`, `net/down.sh`) creates and destroys the whole
+  topology. It must be reproducible.
+- Experiments, each with a number in the README:
+  - Cut the primary's veth during a run, and measure the failover time.
+  - Latency with 0, 1 and 2 router hops; add `netem delay` and watch p99.
+  - Packet loss on the feeds, and how many snapshots it takes to recover.
+- Wireshark capture plus a small Lua dissector, so messages show up as
+  `NewOrder id=17 px=10050 qty=3` instead of hex.
 
 ### Build order
 
-```mermaid
-flowchart LR
-    S1["1. Binary protocol<br/>and framing"] --> S2["2. TCP gateway<br/>(epoll)"]
-    S2 --> S3["3. Sequencer and<br/>event log"]
-    S3 --> S4["4. Backup engine<br/>and replay"]
-    S4 --> S5["5. Heartbeat and<br/>failover"]
-    S5 --> S6["6. UDP feeds A/B<br/>and gap recovery"]
-    S6 --> S7["7. Practice network<br/>and latency tests"]
-```
+Each step ends with a demo and a test. Do not start the next step until the
+current one's test passes.
 
-Steps 1, 2 and 7 are networking practice. Steps 3 to 6 are the distributed
-systems part.
+| # | Step | Demo | Test |
+|---|---|---|---|
+| 0 | V1 determinism | same file -> identical output | `diff` twice |
+| A1 | Benchmark | one table of numbers | stable across runs (±5%) |
+| A2 | Profile | flamegraph + top 3 costs | - |
+| A3 | Optimize | before/after table | differential vs V1 |
+| B1 | Protocol | round-trip encode/decode | fuzz, fragmented reads |
+| B2 | Gateway | `nc`-style client gets acks | 100 clients, 1 bad client |
+| B3 | Sequencer + log | kill, replay, same book | recovery test |
+| B4 | Backup | two engines, matching hashes | continuous hash check |
+| B5 | Failover | kill primary, trading continues | 100 random kills |
+| B6 | Feeds | subscriber mirrors the book | netem loss |
+| B7 | Network | namespace topology | failover over a cut cable |
 
-### How far it could go later (V3 ideas)
+A1-A3 are performance engineering. B1, B2 and B7 are networking. B3-B6 are
+distributed systems.
 
-- Real protocols (FIX for orders, ITCH or SBE for market data).
-- A risk gateway that rejects bad orders.
-- Many instruments split over several engine processes.
-- Kernel bypass (DPDK) and hardware timestamps. This is real HFT territory and
-  needs special hardware, so it is out of scope in WSL.
+---
+
+## Non-goals for V2
+
+Writing these down keeps the scope honest:
+
+- Multiple instruments, multiple sequencers, consensus (Raft/Paxos).
+- Real exchange protocols (FIX, ITCH, SBE).
+- Kernel bypass (DPDK), hardware timestamps, FPGA. Not possible in WSL anyway.
+- Risk checks beyond basic validation.
+
+## V3, later
+
+- Replicate the sequencer (Raft) to remove the single point of failure.
+- FIX gateway, ITCH-style feed.
+- Many instruments sharded over engine processes.
+- Risk gateway.
+- Kernel bypass on real hardware.
+
+## Results (fill in as you go)
+
+| Metric | V1 | V2 |
+|---|---|---|
+| Core throughput (M orders/s) | | |
+| Core latency p50 / p99 / p99.9 (ns) | | |
+| End-to-end loopback p99 (µs) | | |
+| Failover time (ms) | | |
+| Feed recovery after 5% loss | | |
