@@ -4,7 +4,12 @@
 
 #include <QMainWindow>
 
+// Forward declarations to let compiler know classes exist, allowing
+// usage of pointers without full headers here.
 class QTableWidget;
+class QComboBox; // BUY or SELL
+class QLineEdit; // Price, such as 100.01
+class QSpinBox; // Quantity
 
 class MainWindow : public QMainWindow {
 public:
@@ -18,6 +23,13 @@ private:
     // For demo purposes ,delete later
     OrderId nextOrderId_ = 1;
     void loadDemo();
+
+    // Let MainWindow access this inputs later
+    QComboBox* sideInput_;
+    QLineEdit* priceInput_;
+    QSpinBox* quantityInput_;
+
+    bool submitOrder();
 };
 
 /*
